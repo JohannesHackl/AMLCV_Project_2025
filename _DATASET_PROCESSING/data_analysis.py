@@ -10,7 +10,7 @@ from PIL import Image
 
 # Configuration
 DATASET_PATH = 'merged_dataset'  # Path to your merged dataset
-OUTPUT_DIR = 'dataset_analysis'  # Where to save plots and tables
+OUTPUT_DIR = 'dataset_analysis/00'  # Where to save plots and tables
 
 # Set style
 sns.set_style("whitegrid")
