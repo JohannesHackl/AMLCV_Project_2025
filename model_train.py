@@ -22,6 +22,23 @@ LEARNING_RATE = 0.001
 NUM_CLASSES = 4  # background + 3 classes (box, bag, barcode)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+"""
+BATCH_SIZE = 16
+NUM_EPOCHS = 50
+LEARNING_RATE = 0.001
+# + Add scheduler
+# + Add early stopping
+
+# If GPU memory errors
+BATCH_SIZE = 12  # or 8
+
+# If training too slow
+NUM_EPOCHS = 30  # minimum
+
+# If overfitting (train loss << val loss)
+# Add data augmentation or reduce epochs
+"""
+
 print(f"Using device: {DEVICE}")
 
 class COCOSegmentationDataset(Dataset):
