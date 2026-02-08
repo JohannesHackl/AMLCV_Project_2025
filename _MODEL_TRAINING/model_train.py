@@ -16,30 +16,11 @@ import matplotlib.pyplot as plt
 # Configuration
 DATASET_PATH = 'merged_dataset'
 MODEL_SAVE_PATH = 'models'
-BATCH_SIZE = 8
-NUM_EPOCHS = 10
+BATCH_SIZE = 12
+NUM_EPOCHS = 30
 LEARNING_RATE = 0.001
 NUM_CLASSES = 4  # background + 3 classes (box, bag, barcode)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-"""
-BATCH_SIZE = 16
-NUM_EPOCHS = 50
-LEARNING_RATE = 0.001
-# + Add scheduler
-# + Add early stopping
-
-# If GPU memory errors
-BATCH_SIZE = 12  # or 8
-
-# If training too slow
-NUM_EPOCHS = 30  # minimum
-
-# If overfitting (train loss << val loss)
-# Add data augmentation or reduce epochs
-"""
-
-print(f"Using device: {DEVICE}")
 
 class COCOSegmentationDataset(Dataset):
     """COCO format dataset for semantic segmentation"""
@@ -120,10 +101,12 @@ def get_model(num_classes, pretrained=True):
     
     # Replace the entire classifier head
     # The classifier is a Sequential with: Conv2d -> BatchNorm2d -> ReLU -> Dropout -> Conv2d
-    model.classifier = torchvision.models.segmentation.deeplabv3.DeepLabHead(960, num_classes)  # type: ignore
+    # MobileNetV3-Large main feature map has 960 channels
+    model.classifier = torchvision.models.segmentation.deeplabv3.DeepLabHead(960, num_classes)
     
     # Replace auxiliary classifier
-    model.aux_classifier = torchvision.models.segmentation.fcn.FCNHead(960, num_classes)  # type: ignore
+    # FIX: MobileNetV3-Large aux feature map has 40 channels (not 960 like ResNet)
+    model.aux_classifier = torchvision.models.segmentation.fcn.FCNHead(40, num_classes)
     
     return model
 
@@ -376,5 +359,6 @@ def train():
     print(f"  - training_history.png")
     print(f"  - predictions_visualization.png")
 
-if __name__ == '__main__':    
+if __name__ == '__main__':
+    print(f"Using device: {DEVICE}")
     train()
