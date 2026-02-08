@@ -211,4 +211,5 @@ venv/
 
 # Dataset
 merged_dataset/
+merged_dataset_augError/
 merged_dataset_backup_before_redistribution/
