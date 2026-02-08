@@ -69,13 +69,6 @@ UNIFIED_CATEGORIES = [
 
 LANCZOS = Image.Resampling.LANCZOS
 
-# Handle different Pillow versions
-# try:
-#     LANCZOS = Image.Resampling.LANCZOS
-# except AttributeError:
-#     LANCZOS = Image.LANCZOS
-
-
 # Define augmentation pipeline
 transform = A.Compose(
     transforms=[
@@ -161,7 +154,7 @@ def scale_bbox(bbox, scale_x, scale_y, offset_x, offset_y):
     ]
 
 def augment_image_and_annotations(image, annotations, img_id_base, ann_id_base):
-    """Create augmented versions of an image with updated annotations"""
+    """Create augmented versions of an image with updated annotations - FIXED VERSION"""
     augmented_data = []
     
     for aug_idx in range(NUM_AUGMENTATIONS_PER_IMAGE):
@@ -183,26 +176,22 @@ def augment_image_and_annotations(image, annotations, img_id_base, ann_id_base):
         
         category_ids = [ann['category_id'] for ann in annotations]
         
-        # Convert segmentation polygons to keypoints for transformation
+        # Convert segmentation polygons to keypoints with metadata tracking
         all_keypoints = []
-        keypoint_to_ann = []
-        ann_polygon_counts = []
+        keypoint_metadata = []  # (ann_idx, poly_idx, point_idx_in_polygon)
         
         for ann_idx, ann in enumerate(annotations):
-            polygon_count = 0
             if 'segmentation' in ann and ann['segmentation']:
-                for polygon in ann['segmentation']:
+                for poly_idx, polygon in enumerate(ann['segmentation']):
                     if len(polygon) >= 6:
-                        points = []
                         for i in range(0, len(polygon), 2):
                             # Clamp coordinates to valid range [0, img_size - 0.01]
                             x = max(0.0, min(polygon[i], img_width - 0.01))
                             y = max(0.0, min(polygon[i+1], img_height - 0.01))
-                            points.append((x, y))
-                        all_keypoints.extend(points)
-                        keypoint_to_ann.extend([ann_idx] * len(points))
-                        polygon_count += 1
-            ann_polygon_counts.append(polygon_count)
+                            all_keypoints.append((x, y))
+                            # Store which annotation, polygon, and point this belongs to
+                            point_idx = len(all_keypoints) - 1
+                            keypoint_metadata.append((ann_idx, poly_idx, i // 2))
         
         try:
             # Apply augmentation
@@ -229,63 +218,64 @@ def augment_image_and_annotations(image, annotations, img_id_base, ann_id_base):
         for norm_bbox in aug_bboxes_norm:
             x, y, w, h = norm_bbox
             pixel_bbox = [
-                x * TARGET_SIZE[0],
-                y * TARGET_SIZE[1],
-                w * TARGET_SIZE[0],
-                h * TARGET_SIZE[1]
+                x * img_width,
+                y * img_height,
+                w * img_width,
+                h * img_height
             ]
             aug_bboxes.append(pixel_bbox)
         
-        # Reconstruct annotations
-        aug_annotations = []
-        keypoint_idx = 0
+        # Reconstruct segmentations from transformed keypoints using metadata
+        # Initialize structure for each annotation's polygons
+        reconstructed_segmentations = {}
+        for ann_idx in range(len(annotations)):
+            if 'segmentation' in annotations[ann_idx] and annotations[ann_idx]['segmentation']:
+                num_polygons = len(annotations[ann_idx]['segmentation'])
+                reconstructed_segmentations[ann_idx] = [[] for _ in range(num_polygons)]
         
-        for ann_idx, ann in enumerate(annotations):
-            if ann_idx >= len(aug_bboxes):
-                # Skip corresponding keypoints
-                if ann_polygon_counts[ann_idx] > 0:
-                    points_to_skip = sum(
-                        len(ann['segmentation'][p]) // 2 
-                        for p in range(ann_polygon_counts[ann_idx])
-                    )
-                    keypoint_idx += points_to_skip
-                continue
+        # Fill in the transformed keypoints based on metadata
+        for original_kp_idx, transformed_kp in enumerate(aug_keypoints):
+            if original_kp_idx < len(keypoint_metadata):
+                ann_idx, poly_idx, pt_idx = keypoint_metadata[original_kp_idx]
                 
+                # Only add if this annotation still exists after bbox filtering
+                if ann_idx < len(aug_bboxes):
+                    x, y = transformed_kp
+                    # Clamp to image bounds
+                    x = max(0.0, min(x, img_width - 0.01))
+                    y = max(0.0, min(y, img_height - 0.01))
+                    
+                    # Ensure the structure exists
+                    if ann_idx in reconstructed_segmentations:
+                        if poly_idx < len(reconstructed_segmentations[ann_idx]):
+                            reconstructed_segmentations[ann_idx][poly_idx].extend([x, y])
+        
+        # Create augmented annotations
+        aug_annotations = []
+        for i, (bbox, cat_id) in enumerate(zip(aug_bboxes, transformed['category_ids'])):
+            # Skip if bbox is too small or invalid
+            if bbox[2] < 1 or bbox[3] < 1:
+                continue
+            
             new_ann = {
-                'id': ann_id_base + aug_idx * 10000 + ann_idx,
-                'image_id': img_id_base + aug_idx + 1,
-                'category_id': ann['category_id'],
-                'bbox': aug_bboxes[ann_idx],
-                'area': aug_bboxes[ann_idx][2] * aug_bboxes[ann_idx][3],
-                'iscrowd': ann.get('iscrowd', 0)
+                'id': ann_id_base + aug_idx * 10000 + i,
+                'image_id': img_id_base,  # Will be updated later
+                'category_id': cat_id,
+                'bbox': bbox,
+                'area': bbox[2] * bbox[3],
+                'iscrowd': 0
             }
             
-            # Reconstruct segmentation from transformed keypoints
-            if 'segmentation' in ann and ann['segmentation'] and ann_polygon_counts[ann_idx] > 0:
-                new_segmentation = []
+            # Add reconstructed segmentation if available
+            if i in reconstructed_segmentations:
+                valid_polygons = []
+                for polygon in reconstructed_segmentations[i]:
+                    # Only keep polygons with at least 3 points (6 coordinates)
+                    if len(polygon) >= 6:
+                        valid_polygons.append(polygon)
                 
-                for poly_idx in range(ann_polygon_counts[ann_idx]):
-                    original_polygon = ann['segmentation'][poly_idx]
-                    num_points = len(original_polygon) // 2
-                    new_polygon = []
-                    
-                    for _ in range(num_points):
-                        if keypoint_idx < len(aug_keypoints):
-                            kp = aug_keypoints[keypoint_idx]
-                            # Clamp keypoints to image boundaries
-                            x_clamped = max(0.0, min(float(kp[0]), TARGET_SIZE[0] - 0.01))
-                            y_clamped = max(0.0, min(float(kp[1]), TARGET_SIZE[1] - 0.01))
-                            new_polygon.extend([x_clamped, y_clamped])
-                            keypoint_idx += 1
-                        else:
-                            keypoint_idx += 1
-                            break
-                    
-                    if len(new_polygon) >= 6:
-                        new_segmentation.append(new_polygon)
-                
-                if new_segmentation:
-                    new_ann['segmentation'] = new_segmentation
+                if valid_polygons:
+                    new_ann['segmentation'] = valid_polygons
             
             aug_annotations.append(new_ann)
         
