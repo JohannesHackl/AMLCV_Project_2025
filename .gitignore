@@ -208,8 +208,16 @@ __marimo__/
 
 # Python virtual environment
 venv/
+.venv/
 
 # Dataset
 merged_dataset/
 merged_dataset_augError/
 merged_dataset_backup_before_redistribution/
+
+# Models
+models/
+
+# Visualization
+visualizations/
+visualization_results/
