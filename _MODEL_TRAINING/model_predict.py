@@ -16,7 +16,7 @@ import seaborn as sns
 
 # Configuration
 DATASET_PATH = 'merged_dataset'
-MODEL_PATH = 'models/best_model.pth'
+MODEL_PATH = 'models/latest_model_E17.pth'
 OUTPUT_DIR = 'model_predictions'
 SPLIT = 'valid'  # or 'test' or 'train'
 NUM_CLASSES = 4
