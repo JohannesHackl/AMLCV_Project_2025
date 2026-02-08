@@ -1,4 +1,0 @@
-Split,Images,Annotations,Avg Ann/Image,Min Ann/Image,Max Ann/Image,Median Ann/Image
-Train,7515,67212,8.94,1,114,7.0
-Valid,1700,18487,10.87,1,82,17.0
-Test,299,5241,17.53,1,59,17.0

@@ -212,12 +212,19 @@ venv/
 
 # Dataset
 merged_dataset/
-merged_dataset_augError/
+merged_dataset_01_augError/
+merged_dataset_02_augError/
+merged_dataset_backup_full/
 merged_dataset_backup_before_redistribution/
 
 # Models
 models/
 
 # Visualization
+model_predictions/
+dataset_visualization/
+dataset_visualizations/
+visualization/
 visualizations/
 visualization_results/
+visualizations_augError/
