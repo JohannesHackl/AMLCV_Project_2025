@@ -17,14 +17,14 @@ import matplotlib.pyplot as plt
 # --- CONFIGURATION ---
 DATASET_PATH = 'merged_dataset'
 MODEL_SAVE_PATH = 'models'
-RESUME_FROM = 'models/best_model.pth'  # Checkpoint to resume
-NUM_ADDITIONAL_EPOCHS = 10             # How many MORE epochs to train
+RESUME_FROM = 'models/final_model_E30.pth'  # Checkpoint to resume
+NUM_ADDITIONAL_EPOCHS = 20             # How many MORE epochs to train
 LEARNING_RATE = 0.0001                 # Lower LR for fine-tuning
-BATCH_SIZE = 12
+BATCH_SIZE = 16
 NUM_CLASSES = 4
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-print(f"Using device: {DEVICE}")
+# print(f"Using device: {DEVICE}")
 
 # --- DATASET CLASS (Same as training) ---
 class COCOSegmentationDataset(Dataset):

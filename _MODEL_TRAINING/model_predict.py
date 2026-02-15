@@ -3,6 +3,7 @@ import torch.nn as nn
 from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large, DeepLabV3_MobileNet_V3_Large_Weights
 from torchvision.models.segmentation.deeplabv3 import DeepLabHead
 from torchvision.models.segmentation.fcn import FCNHead
+from torchvision import transforms 
 from torch.utils.data import Dataset, DataLoader
 import json
 import numpy as np
@@ -13,10 +14,12 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from tqdm import tqdm
 import seaborn as sns
+import random
+from typing import Any
 
 # Configuration
 DATASET_PATH = 'merged_dataset'
-MODEL_PATH = 'models/latest_model_E17.pth'
+MODEL_PATH = 'models/best_model.pth' # Make sure this matches your actual file name
 OUTPUT_DIR = 'model_predictions'
 SPLIT = 'valid'  # or 'test' or 'train'
 NUM_CLASSES = 4
@@ -40,6 +43,14 @@ class COCOSegmentationDataset(Dataset):
         self.dataset_path = Path(dataset_path)
         self.split = split
         
+        # --- ADDED: Normalization Transform ---
+        # This matches the Albumentations normalization used during training
+        self.transform = transforms.Compose([
+            transforms.ToTensor(), # Converts to [0, 1]
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                 std=[0.229, 0.224, 0.225])
+        ])
+        
         # Load annotations
         ann_file = self.dataset_path / split / '_annotations.coco.json'
         
@@ -53,7 +64,6 @@ class COCOSegmentationDataset(Dataset):
         
         self.images = self.coco_data['images']
         self.annotations = self.coco_data['annotations']
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
         
         # Group annotations by image
         self.img_to_anns = {}
@@ -74,10 +84,9 @@ class COCOSegmentationDataset(Dataset):
         
         # Load image
         img_path = self.dataset_path / self.split / img_info['file_name']
-        
         if not img_path.exists():
             raise FileNotFoundError(f"Image not found: {img_path}")
-        
+            
         image = Image.open(img_path).convert('RGB')
         
         # Create segmentation mask
@@ -87,27 +96,29 @@ class COCOSegmentationDataset(Dataset):
         if img_id in self.img_to_anns:
             for ann in self.img_to_anns[img_id]:
                 category_id = ann['category_id']
-                
                 if 'segmentation' in ann and ann['segmentation']:
                     for polygon in ann['segmentation']:
                         if len(polygon) >= 6:
                             pts = np.array(polygon).reshape(-1, 2).astype(np.int32)
                             cv2.fillPoly(mask, [pts], category_id)
         
-        # Convert to tensors
-        image_array = np.array(image)
-        image_tensor = image_array.astype(np.float32) / 255.0
-        image_tensor = torch.from_numpy(image_tensor).permute(2, 0, 1)
+        # --- FIXED: Use Transform for Normalization ---
+        # Keep original image array for visualization (0-255)
+        image_vis = np.array(image)
+        
+        # Apply normalization for the model input
+        image_tensor = self.transform(image)
+        
         mask_tensor = torch.from_numpy(mask).long()
         
-        return image_tensor, mask_tensor, image_array, mask, img_info['file_name']
+        return image_tensor, mask_tensor, image_vis, mask, img_info['file_name']
 
 def get_model(num_classes):
     """Load model architecture"""
     weights = DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT
     model = deeplabv3_mobilenet_v3_large(weights=weights)
-    model.classifier = DeepLabHead(960, num_classes)  # type: ignore
-    model.aux_classifier = FCNHead(40, num_classes)  # type: ignore
+    model.classifier = DeepLabHead(960, num_classes)
+    model.aux_classifier = FCNHead(40, num_classes)
     return model
 
 def mask_to_color(mask, colors):
@@ -186,17 +197,20 @@ def create_grid_visualization(images_data, save_path, grid_size=(4, 4)):
     rows, cols = grid_size
     num_samples = min(len(images_data), rows * cols)
     
-    fig, axes = plt.subplots(rows, cols * 3, figsize=(cols * 9, rows * 3))
-    
+    fig, axes_raw = plt.subplots(rows, cols * 3, figsize=(cols * 9, rows * 3))
+    axes: Any = np.array(axes_raw)
+
     # Ensure axes is 2D array
     if rows == 1:
-        axes = axes.reshape(1, -1)
+        axes = np.array(axes).reshape(1, -1)
+    else:
+        axes = np.array(axes)
     
     for idx in range(num_samples):
         row = idx // cols
         col = idx % cols
         
-        image, gt_mask, pred_mask = images_data[idx]
+        image, gt_mask, pred_mask, _ = images_data[idx]
         
         # Original image
         axes[row, col*3].imshow(image)
@@ -249,8 +263,8 @@ def create_class_specific_visualizations(images_data, save_dir):
         
         print(f"    Processing class: {class_name}")
         
-        fig, axes = plt.subplots(4, 6, figsize=(24, 16))
-        axes = axes.flatten()
+        fig, axes_raw = plt.subplots(4, 6, figsize=(24, 16))
+        axes: Any = np.array(axes_raw).flatten()
         
         count = 0
         for image, gt_mask, pred_mask, filename in images_data:
@@ -267,6 +281,9 @@ def create_class_specific_visualizations(images_data, save_dir):
             
             # Overlay on image
             overlay = image.copy()
+            # Fade non-target areas slightly
+            
+            # Highlight GT
             overlay[gt_binary > 0] = overlay[gt_binary > 0] * 0.5 + np.array(CLASS_COLORS[class_id]) * 0.5
             
             # Show prediction contours
@@ -322,6 +339,71 @@ def create_confusion_heatmap(confusion_matrix, save_path):
     plt.close()
     print(f"  ✓ Saved: {save_path}")
 
+def get_balanced_subset(all_data, num_samples):
+    """
+    Selects a subset of data that evenly ensures all classes are represented.
+    Strategies: Round Robin selection of Box (1), Bag (2), Barcode (3).
+    """
+    print(f"\n  Selecting balanced subset of {num_samples} images...")
+    
+    # 1. Bucket data by class presence
+    # Note: An image can be in multiple buckets
+    class_buckets = {1: [], 2: [], 3: []}
+    
+    for i, item in enumerate(all_data):
+        # item structure: (image, gt_mask, pred, filename)
+        gt_mask = item[1]
+        classes_in_img = np.unique(gt_mask)
+        
+        for cls_id in [1, 2, 3]:
+            if cls_id in classes_in_img:
+                class_buckets[cls_id].append(i)
+                
+    # 2. Round robin selection
+    selected_indices = []
+    seen_indices = set()
+    
+    target_per_class = num_samples // 3
+    
+    # We loop until we have enough samples
+    while len(selected_indices) < num_samples:
+        added_in_this_round = False
+        
+        # Try to pick one from each class
+        for cls_id in [1, 2, 3]:
+            if len(selected_indices) >= num_samples:
+                break
+                
+            # Find the first index in this class bucket that we haven't used yet
+            found_new = False
+            for idx in class_buckets[cls_id]:
+                if idx not in seen_indices:
+                    selected_indices.append(idx)
+                    seen_indices.add(idx)
+                    found_new = True
+                    added_in_this_round = True
+                    break
+            
+            # Optional: Rotate the bucket to prioritize different images next time?
+            # Or just rely on the list iterator order.
+            
+        if not added_in_this_round:
+            # If we couldn't add any specific class images (maybe we ran out of 'box' images),
+            # fill the rest with whatever random images are left.
+            remaining = [i for i in range(len(all_data)) if i not in seen_indices]
+            
+            if not remaining:
+                print("    Warning: Not enough unique images to fill request.")
+                break
+                
+            needed = num_samples - len(selected_indices)
+            fillers = remaining[:needed]
+            selected_indices.extend(fillers)
+            break
+            
+    # Return the data items
+    return [all_data[i] for i in selected_indices]
+
 def visualize_predictions():
     """Main visualization function"""
     
@@ -329,9 +411,9 @@ def visualize_predictions():
     print("STARTING VISUALIZATION PIPELINE")
     print("="*70)
     
-    # Create output directory - add to subfolder "00"
+    # Create output directory
     output_path = Path(OUTPUT_DIR) / '00'
-    output_path.mkdir(exist_ok=True)
+    output_path.mkdir(exist_ok=True, parents=True)
     print(f"\nOutput directory: {output_path.absolute()}")
     
     individual_dir = output_path / 'individual_predictions'
@@ -356,12 +438,11 @@ def visualize_predictions():
     
     model = get_model(NUM_CLASSES)
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model.load_state_dict(checkpoint['model'])
     model = model.to(DEVICE)
     model.eval()
     
-    print(f"✓ Model loaded from epoch {checkpoint['epoch']}")
-    print(f"✓ Validation loss: {checkpoint['val_loss']:.4f}")
+    print(f"✓ Model loaded from epoch {checkpoint.get('epoch', 'Unknown')}")
     
     # Collect predictions
     print("\n" + "="*70)
@@ -393,26 +474,32 @@ def visualize_predictions():
     
     print(f"\n✓ Generated {len(all_data)} predictions")
     
+    # --- NEW: Get Balanced Subset for Visuals ---
+    # We want 20 for individual, 16 for grid. Let's get 20 balanced ones.
+    balanced_data = get_balanced_subset(all_data, 20)
+    
     # Create individual visualizations
     print("\n" + "="*70)
-    print("CREATING INDIVIDUAL VISUALIZATIONS (first 20)")
+    print("CREATING INDIVIDUAL VISUALIZATIONS (Balanced)")
     print("="*70)
     
-    for idx in range(min(20, len(all_data))):
-        image, gt_mask, pred, filename = all_data[idx]
+    for idx, (image, gt_mask, pred, filename) in enumerate(balanced_data):
         save_path = individual_dir / f'prediction_{idx:03d}_{filename}'
         visualize_single_prediction(image, gt_mask, pred, filename, save_path)
     
-    print(f"\n✓ Created {min(20, len(all_data))} individual visualizations")
+    print(f"\n✓ Created {len(balanced_data)} individual visualizations")
     
     # Create grid visualization
     print("\n" + "="*70)
-    print("CREATING GRID VISUALIZATION")
+    print("CREATING GRID VISUALIZATION (Balanced)")
     print("="*70)
-    grid_data = [(img, gt, pred) for img, gt, pred, _ in all_data[:16]]
+    
+    # We use the first 16 from our balanced set for the 4x4 grid
+    grid_subset = balanced_data[:16]
+    grid_data = [(img, gt, pred, fname) for img, gt, pred, fname in grid_subset]
     create_grid_visualization(grid_data, output_path / 'predictions_grid.png', grid_size=(4, 4))
     
-    # Create class-specific visualizations
+    # Create class-specific visualizations (This uses all data to find examples)
     print("\n" + "="*70)
     print("CREATING CLASS-SPECIFIC VISUALIZATIONS")
     print("="*70)
@@ -448,11 +535,9 @@ def visualize_predictions():
     print("✓ ALL VISUALIZATIONS COMPLETE!")
     print("="*70)
     print(f"\nResults saved to: {output_path.absolute()}/")
-    print(f"  - individual_predictions/ ({min(20, len(all_data))} detailed predictions)")
-    print(f"  - predictions_grid.png (4x4 grid overview)")
-    print(f"  - class_box_visualization.png")
-    print(f"  - class_bag_visualization.png")
-    print(f"  - class_barcode_visualization.png")
+    print(f"  - individual_predictions/ ({len(balanced_data)} examples, balanced classes)")
+    print(f"  - predictions_grid.png (4x4 balanced grid)")
+    print(f"  - class_box/bag/barcode_visualization.png")
     print(f"  - confusion_matrix.png")
     print("\n" + "="*70)
 

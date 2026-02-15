@@ -1,0 +1,13 @@
+======================================================================
+FINAL METRICS (Validation Set)
+======================================================================
+Mean IoU: 0.9433
+
+Per-class IoU:
+  background: 0.9578
+  box: 0.9480
+  bag: 0.9282
+  barcode: 0.9393
+
+Generating prediction visualizations...
+✓ Visualizations saved to models/predictions_visualization.png

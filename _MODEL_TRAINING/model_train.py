@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision
-from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large
-from torchvision.models.segmentation.deeplabv3 import DeepLabHead
-from torchvision.models.segmentation.fcn import FCNHead
+from torchvision.models.segmentation import deeplabv3_mobilenet_v3_large, DeepLabV3_MobileNet_V3_Large_Weights
 from torch.utils.data import Dataset, DataLoader
 import json
 import numpy as np
@@ -12,18 +10,20 @@ from pathlib import Path
 import cv2
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 # Configuration
 DATASET_PATH = 'merged_dataset'
 MODEL_SAVE_PATH = 'models'
 BATCH_SIZE = 12
-NUM_EPOCHS = 30
+NUM_EPOCHS = 50  # Increased since we have early stopping
 LEARNING_RATE = 0.001
-NUM_CLASSES = 4  # background + 3 classes (box, bag, barcode)
+NUM_CLASSES = 4  # background + 3 classes
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class COCOSegmentationDataset(Dataset):
-    """COCO format dataset for semantic segmentation"""
+    """COCO format dataset for semantic segmentation with Albumentations"""
     
     def __init__(self, dataset_path, split='train', transform=None):
         self.dataset_path = Path(dataset_path)
@@ -32,12 +32,14 @@ class COCOSegmentationDataset(Dataset):
         
         # Load annotations
         ann_file = self.dataset_path / split / '_annotations.coco.json'
+        if not ann_file.exists():
+            raise FileNotFoundError(f"Annotation file not found: {ann_file}")
+            
         with open(ann_file, 'r') as f:
             self.coco_data = json.load(f)
         
         self.images = self.coco_data['images']
         self.annotations = self.coco_data['annotations']
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
         
         # Group annotations by image
         self.img_to_anns = {}
@@ -47,7 +49,7 @@ class COCOSegmentationDataset(Dataset):
                 self.img_to_anns[img_id] = []
             self.img_to_anns[img_id].append(ann)
         
-        print(f"{split} dataset: {len(self.images)} images, {len(self.annotations)} annotations")
+        print(f"{split} dataset: {len(self.images)} images")
     
     def __len__(self):
         return len(self.images)
@@ -58,7 +60,7 @@ class COCOSegmentationDataset(Dataset):
         
         # Load image
         img_path = self.dataset_path / self.split / img_info['file_name']
-        image = Image.open(img_path).convert('RGB')
+        image = np.array(Image.open(img_path).convert('RGB'))
         
         # Create segmentation mask
         mask = np.zeros((img_info['height'], img_info['width']), dtype=np.uint8)
@@ -67,52 +69,96 @@ class COCOSegmentationDataset(Dataset):
         if img_id in self.img_to_anns:
             for ann in self.img_to_anns[img_id]:
                 category_id = ann['category_id']
-                
                 if 'segmentation' in ann and ann['segmentation']:
-                    # Draw polygon segmentation
                     for polygon in ann['segmentation']:
-                        if len(polygon) >= 6:  # At least 3 points
+                        if len(polygon) >= 6:
                             pts = np.array(polygon).reshape(-1, 2).astype(np.int32)
                             cv2.fillPoly(mask, [pts], category_id)
         
-        # Convert to tensors
-        image = np.array(image)
+        # Apply Albumentations (Augmentation + Normalization + ToTensor)
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask']
+        else:
+            # Fallback if no transform provided (shouldn't happen with correct setup)
+            transform = A.Compose([A.Normalize(), ToTensorV2()])
+            augmented = transform(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask']
+
+        return image, mask.long()
+
+def get_transforms(split='train'):
+    """Get Albumentations transforms for segmentation"""
+    if split == 'train':
+        return A.Compose([
+            # Geometric Augmentations
+            A.Rotate(limit=15, p=0.5),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.1),
+            A.Perspective(scale=(0.05, 0.1), p=0.3),
+            A.Affine(shear=(-10, 10), p=0.3),
+            
+            # Color/Noise Augmentations
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2),
+                A.RandomGamma(gamma_limit=(80, 120)),
+            ], p=0.5),
+            A.GaussNoise(p=0.2),
+            
+            # Normalization & Conversion
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+    else:
+        return A.Compose([
+            # Validation: Only Normalize & Convert
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+def compute_class_weights(dataloader, num_classes, device):
+    """Calculate class weights based on pixel frequency"""
+    print("Computing class weights...")
+    pixel_counts = torch.zeros(num_classes, device=device)
+    
+    # We only need to check a subset to get a good estimate
+    num_batches = 0
+    max_batches = 50 
+    
+    for _, masks in dataloader:
+        masks = masks.to(device)
+        for i in range(num_classes):
+            pixel_counts[i] += (masks == i).sum()
         
-        # Simple normalization
-        image = image.astype(np.float32) / 255.0
-        
-        # Transpose to CHW format
-        image = torch.from_numpy(image).permute(2, 0, 1)
-        mask = torch.from_numpy(mask).long()
-        
-        return image, mask
+        num_batches += 1
+        if num_batches >= max_batches:
+            break
+            
+    total_pixels = pixel_counts.sum()
+    # Formula: total / (num_classes * frequency)
+    weights = total_pixels / (num_classes * pixel_counts)
+    
+    # Normalize weights so they aren't too large
+    weights = weights / weights.mean()
+    
+    print(f"Class Weights: {weights.cpu().numpy()}")
+    return weights
 
 def get_model(num_classes, pretrained=True):
-    """Load pre-trained DeepLabV3 with MobileNetV3 backbone"""
-    
-    # Load pre-trained model with updated API
-    from torchvision.models.segmentation import DeepLabV3_MobileNet_V3_Large_Weights
-    
     if pretrained:
         weights = DeepLabV3_MobileNet_V3_Large_Weights.DEFAULT
         model = deeplabv3_mobilenet_v3_large(weights=weights)
     else:
         model = deeplabv3_mobilenet_v3_large(weights=None)
     
-    # Replace the entire classifier head
-    # The classifier is a Sequential with: Conv2d -> BatchNorm2d -> ReLU -> Dropout -> Conv2d
-    # MobileNetV3-Large main feature map has 960 channels
     model.classifier = torchvision.models.segmentation.deeplabv3.DeepLabHead(960, num_classes)
-    
-    # Replace auxiliary classifier
-    # FIX: MobileNetV3-Large aux feature map has 40 channels (not 960 like ResNet)
     model.aux_classifier = torchvision.models.segmentation.fcn.FCNHead(40, num_classes)
-    
     return model
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
-    """Train for one epoch"""
-    model.train()
+    model.train() # Dropout ON
     running_loss = 0.0
     
     pbar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]')
@@ -120,31 +166,23 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
         images = images.to(device)
         masks = masks.to(device)
         
-        # Forward pass
         optimizer.zero_grad()
         outputs = model(images)
         
-        # DeepLabV3 returns a dict with 'out' and 'aux' keys
         loss = criterion(outputs['out'], masks)
-        
-        # Add auxiliary loss if available
         if 'aux' in outputs:
-            aux_loss = criterion(outputs['aux'], masks)
-            loss += 0.4 * aux_loss
+            loss += 0.4 * criterion(outputs['aux'], masks)
         
-        # Backward pass
         loss.backward()
         optimizer.step()
         
         running_loss += loss.item()
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
     
-    epoch_loss = running_loss / len(dataloader)
-    return epoch_loss
+    return running_loss / len(dataloader)
 
 def validate(model, dataloader, criterion, device, epoch):
-    """Validate the model"""
-    model.eval()
+    model.eval() # Dropout OFF
     running_loss = 0.0
     
     with torch.no_grad():
@@ -159,71 +197,32 @@ def validate(model, dataloader, criterion, device, epoch):
             running_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
     
-    epoch_loss = running_loss / len(dataloader)
-    return epoch_loss
-
-def calculate_metrics(model, dataloader, device, num_classes):
-    """Calculate IoU and other metrics"""
-    model.eval()
-    
-    # Initialize confusion matrix
-    confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
-    
-    with torch.no_grad():
-        for images, masks in tqdm(dataloader, desc='Calculating metrics'):
-            images = images.to(device)
-            masks = masks.to(device)
-            
-            outputs = model(images)
-            preds = outputs['out'].argmax(dim=1)
-            
-            # Update confusion matrix
-            for pred, mask in zip(preds, masks):
-                pred_np = pred.cpu().numpy().flatten()
-                mask_np = mask.cpu().numpy().flatten()
-                
-                for i in range(num_classes):
-                    for j in range(num_classes):
-                        confusion_matrix[i, j] += np.sum((mask_np == i) & (pred_np == j))
-    
-    # Calculate IoU for each class
-    iou_per_class = []
-    for i in range(num_classes):
-        intersection = confusion_matrix[i, i]
-        union = confusion_matrix[i, :].sum() + confusion_matrix[:, i].sum() - intersection
-        iou = intersection / (union + 1e-6)
-        iou_per_class.append(iou)
-    
-    mean_iou = np.mean(iou_per_class)
-    
-    return mean_iou, iou_per_class, confusion_matrix
+    return running_loss / len(dataloader)
 
 def visualize_predictions(model, dataset, device, num_samples=4):
-    """Visualize some predictions"""
     model.eval()
-    
     fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5*num_samples))
+    colors = {0: [0, 0, 0], 1: [255, 0, 0], 2: [0, 255, 0], 3: [0, 0, 255]} # B, R, G, B
     
-    # Class colors for visualization
-    colors = {
-        0: [0, 0, 0],       # background - black
-        1: [255, 0, 0],     # box - red
-        2: [0, 255, 0],     # bag - green
-        3: [0, 0, 255]      # barcode - blue
-    }
+    # Denormalize for display
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
     
     with torch.no_grad():
         for i in range(num_samples):
             idx = np.random.randint(0, len(dataset))
-            image, mask = dataset[idx]
+            # Get raw image for visualization (bypass transform normalization for display)
+            # Hack: access dataset internals to get clean image
+            img_info = dataset.images[idx]
+            raw_img = Image.open(dataset.dataset_path / dataset.split / img_info['file_name']).convert('RGB')
+            raw_img = np.array(raw_img)
             
-            # Predict
-            image_input = image.unsqueeze(0).to(device)
-            output = model(image_input)
+            # Get tensor for model
+            image_tensor, mask_tensor = dataset[idx]
+            
+            output = model(image_tensor.unsqueeze(0).to(device))
             pred = output['out'].argmax(dim=1).squeeze(0).cpu().numpy()
-            
-            # Convert to displayable format
-            image_display = image.permute(1, 2, 0).numpy()
+            mask = mask_tensor.cpu().numpy()
             
             # Create colored masks
             mask_colored = np.zeros((*mask.shape, 3), dtype=np.uint8)
@@ -233,132 +232,95 @@ def visualize_predictions(model, dataset, device, num_samples=4):
                 mask_colored[mask == class_id] = color
                 pred_colored[pred == class_id] = color
             
-            # Plot
-            axes[i, 0].imshow(image_display)
+            axes[i, 0].imshow(raw_img)
             axes[i, 0].set_title('Input Image')
-            axes[i, 0].axis('off')
-            
             axes[i, 1].imshow(mask_colored)
             axes[i, 1].set_title('Ground Truth')
-            axes[i, 1].axis('off')
-            
             axes[i, 2].imshow(pred_colored)
             axes[i, 2].set_title('Prediction')
-            axes[i, 2].axis('off')
-    
+            
     plt.tight_layout()
-    plt.savefig(Path(MODEL_SAVE_PATH) / 'predictions_visualization.png', dpi=150, bbox_inches='tight')
+    plt.savefig(Path(MODEL_SAVE_PATH) / 'predictions_visualization.png')
     plt.close()
-    print(f"✓ Visualizations saved to {MODEL_SAVE_PATH}/predictions_visualization.png")
 
 def train():
-    """Main training function"""
-    
-    # Create model directory
     Path(MODEL_SAVE_PATH).mkdir(exist_ok=True)
     
-    # Load datasets
+    # 1. Setup Data with Augmentations
     print("\nLoading datasets...")
-    train_dataset = COCOSegmentationDataset(DATASET_PATH, split='train')
-    valid_dataset = COCOSegmentationDataset(DATASET_PATH, split='valid')
+    train_dataset = COCOSegmentationDataset(DATASET_PATH, split='train', transform=get_transforms('train'))
+    valid_dataset = COCOSegmentationDataset(DATASET_PATH, split='valid', transform=get_transforms('valid'))
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                             num_workers=4, pin_memory=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, 
-                             num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
     
-    # Initialize model
-    print("\nInitializing model...")
-    model = get_model(NUM_CLASSES, pretrained=True)
-    model = model.to(DEVICE)
+    # 2. Setup Model & Class Weights
+    model = get_model(NUM_CLASSES, pretrained=True).to(DEVICE)
     
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # Compute weights from a subset of training data
+    class_weights = compute_class_weights(train_loader, NUM_CLASSES, DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     
-    # Training loop
+    # 3. Optimizer (AdamW) & Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+    )
+    
+    # 4. Training Loop with Early Stopping
     print("\nStarting training...")
-    print("="*70)
-    
     best_val_loss = float('inf')
-    history = {'train_loss': [], 'val_loss': []}
+    early_stop_patience = 7
+    no_improve_count = 0
+    history = {'train_loss': [], 'val_loss': [], 'lr': []}
     
     for epoch in range(NUM_EPOCHS):
-        # Train
+        # Train & Validate
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE, epoch)
-        
-        # Validate
         val_loss = validate(model, valid_loader, criterion, DEVICE, epoch)
         
-        # Save history
+        # Step Scheduler
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} - Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f} | LR: {current_lr:.6f}")
+        scheduler.step(val_loss)
+        
+        # Log
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
+        history['lr'].append(current_lr)
         
-        print(f"\nEpoch {epoch+1}/{NUM_EPOCHS}")
-        print(f"  Train Loss: {train_loss:.4f}")
-        print(f"  Valid Loss: {val_loss:.4f}")
+        print(f"  Train Loss: {train_loss:.4f} | Valid Loss: {val_loss:.4f} | LR: {current_lr:.6f}")
         
-        # Save best model
+        # Early Stopping & Saving
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            no_improve_count = 0
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'val_loss': val_loss,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
             }, Path(MODEL_SAVE_PATH) / 'best_model.pth')
-            print(f"  ✓ Best model saved!")
-        
-        print("="*70)
+            print("  ✓ New best model saved!")
+        else:
+            no_improve_count += 1
+            print(f"  ! No improvement for {no_improve_count}/{early_stop_patience} epochs")
+            
+        if no_improve_count >= early_stop_patience:
+            print("\nEarly stopping triggered!")
+            break
+            
+    # Final cleanup
+    print("Generating final visualizations...")
+    visualize_predictions(model, valid_dataset, DEVICE)
     
-    # Save final model
-    torch.save({
-        'epoch': NUM_EPOCHS,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'history': history,
-    }, Path(MODEL_SAVE_PATH) / 'final_model.pth')
-    
-    # Plot training curves
-    plt.figure(figsize=(10, 6))
-    plt.plot(history['train_loss'], label='Train Loss', marker='o')
-    plt.plot(history['val_loss'], label='Validation Loss', marker='s')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training History')
+    # Plot history
+    plt.figure()
+    plt.plot(history['train_loss'], label='Train')
+    plt.plot(history['val_loss'], label='Valid')
     plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(Path(MODEL_SAVE_PATH) / 'training_history.png', dpi=150, bbox_inches='tight')
+    plt.savefig(Path(MODEL_SAVE_PATH) / 'training_history.png')
     plt.close()
-    
-    # Calculate final metrics
-    print("\nCalculating final metrics on validation set...")
-    model.load_state_dict(torch.load(Path(MODEL_SAVE_PATH) / 'best_model.pth')['model_state_dict'])
-    mean_iou, iou_per_class, conf_matrix = calculate_metrics(model, valid_loader, DEVICE, NUM_CLASSES)
-    
-    print("\n" + "="*70)
-    print("FINAL METRICS (Validation Set)")
-    print("="*70)
-    print(f"Mean IoU: {mean_iou:.4f}")
-    print("\nPer-class IoU:")
-    class_names = ['background', 'box', 'bag', 'barcode']
-    for i, (name, iou) in enumerate(zip(class_names, iou_per_class)):
-        print(f"  {name}: {iou:.4f}")
-    
-    # Visualize predictions
-    print("\nGenerating prediction visualizations...")
-    visualize_predictions(model, valid_dataset, DEVICE, num_samples=4)
-    
-    print("\n" + "="*70)
-    print("✓ Training complete!")
-    print("="*70)
-    print(f"Models saved to: {MODEL_SAVE_PATH}/")
-    print(f"  - best_model.pth (best validation loss)")
-    print(f"  - final_model.pth (last epoch)")
-    print(f"  - training_history.png")
-    print(f"  - predictions_visualization.png")
 
 if __name__ == '__main__':
-    print(f"Using device: {DEVICE}")
     train()

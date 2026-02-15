@@ -7,7 +7,7 @@ from collections import defaultdict, Counter
 
 # --- CONFIGURATION ---
 DATASET_PATH = Path('merged_dataset')
-BACKUP_PATH = Path('merged_dataset_backup_full')
+BACKUP_PATH = Path('merged_dataset_preRedistribution')
 RANDOM_SEED = 42
 
 # Ratios: 70% Train, 20% Valid, 10% Test

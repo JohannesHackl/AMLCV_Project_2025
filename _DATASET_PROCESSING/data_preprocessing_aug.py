@@ -57,7 +57,7 @@ TARGET_SIZE = (512, 512)
 OUTPUT_DIR = 'merged_dataset'
 
 # Augmentation settings
-AUGMENT_DATASETS = ['dataset1', 'dataset3', 'dataset5']
+AUGMENT_DATASETS = []   # e.g. ['dataset1', 'dataset3', 'dataset5']
 NUM_AUGMENTATIONS_PER_IMAGE = 3
 
 # Unified label names

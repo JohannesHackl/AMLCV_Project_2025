@@ -1,4 +1,0 @@
-Class,ID,Train Instances,Train Images,Train Inst/Img,Valid Instances,Valid Images,Valid Inst/Img,Test Instances,Test Images,Test Inst/Img
-box,1,51375,5288,9.72,14696,1510,9.73,7317,758,9.65
-bag,2,6935,889,7.80,1916,253,7.57,1022,129,7.92
-barcode,3,1891,1060,1.78,547,303,1.81,276,152,1.82
